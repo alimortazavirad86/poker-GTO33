@@ -414,7 +414,7 @@ def plotly_table(seat_count:int, btn_seat:int, hero_seat:int, pos_by_seat:Dict[i
         i = hero_seat
         angle = -_m.pi/2 + (2*_m.pi * i / seat_count)
         hx = cx + (rx+7) * _m.cos(angle); hy = cy + (ry+10) * _m.sin(angle)
-        for k,c in enumerate(hero_codes:
+        for k,c in enumerate(hero_codes):
             fig.add_shape(type="rect", x0=hx-8+9*k, y0=hy-6, x1=hx-1+9*k, y1=hy+6, line=dict(color="#cbd5e1"), fillcolor="#f8fafc")
             r,s = c[0], c[1].lower()
             fig.add_annotation(x=hx-4+9*k, y=hy, text=f"<b>{r}{SUIT_SYM[s]}</b>", showarrow=False, font=dict(color=SUIT_COLOR[s], size=16))
