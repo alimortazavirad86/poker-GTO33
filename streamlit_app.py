@@ -5,16 +5,17 @@ import math
 from collections import Counter
 import plotly.graph_objects as go
 
-# ================== Poker GTO Helper — Big Table (Auto "action behind") ==================
+# ================== Poker GTO Helper — Big Table (Mode Toggle + Auto "action behind") ==================
 # - Full-featured table: seats, blinds, action windows, pot auto-adjust
 # - Plotly-rendered table
 # - Decision box shows best action + full action percentages
 # - AUTO: if players behind you raise/call and change the price before action returns to you,
 #         the decision automatically recomputes with the updated facing bet.
+# - MODE TOGGLE: "Exploit + ICM" (personalities & bubble factor ON) vs "Strict GTO" (ICM OFF, exploit OFF)
 
 st.set_page_config(page_title="Poker GTO Helper (Unified)", page_icon="♠️", layout="wide")
 st.title("♠️ Poker GTO Decision Helper — Unified")
-st.caption("Big-table app with Plotly table, pot evolution, and automatic re-compute if action changes behind you")
+st.caption("Big-table app with Plotly table, pot evolution, automatic 'action behind' handling, and a GTO vs ICM toggle")
 
 # -------- Core cards --------
 Position = Literal["UTG", "MP", "CO", "BTN", "SB", "BB"]
@@ -137,7 +138,7 @@ def equity_from_outs(outs:int, cards_to_come:int) -> float:
     return min(0.95, (outs * (4 if cards_to_come==2 else 2)) / 100)
 
 _POS_TIGHTNESS = {"UTG":1.00,"MP":0.92,"CO":0.84,"BTN":0.75,"SB":0.80,"BB":0.90}
-def bubble_factor(players_left:int, total_players:int) -> float:
+def _bubble_factor(players_left:int, total_players:int) -> float:
     if total_players<=0 or players_left<=0: return 1.0
     pct = players_left/max(1,total_players)
     if pct<=0.05: return 1.5
@@ -213,9 +214,10 @@ class PostflopContext:
 # ================== Strategy (returns full action mix) ==================
 def gto_preflop_mix(hand:str, position:Position, stack_bb:float, players_left:int, total_players:int,
                     facing_open:bool=False, open_size_bb:float=2.5, facing_shove:bool=False, shove_size_bb:float=0.0,
-                    pot_before_hero_bb:float=0.0, exploit_adj:float=0.0) -> Dict[str,str]:
+                    pot_before_hero_bb:float=0.0, exploit_adj:float=0.0, strict:bool=False) -> Dict[str,str]:
     combo, hi, lo, suited = normalize_combo(hand)
-    bub = bubble_factor(players_left, total_players)
+    bub = 1.0 if strict else _bubble_factor(players_left, total_players)
+    exploit_adj = 0.0 if strict else exploit_adj
 
     # Facing jam
     if facing_shove and shove_size_bb>0:
@@ -230,7 +232,7 @@ def gto_preflop_mix(hand:str, position:Position, stack_bb:float, players_left:in
             "primary": best, "best": best, "best_pct": best_p,
             "mix": f"CALL {_pct_round(p_call)}% / FOLD {_pct_round(1-p_call)}%",
             "all": allp,
-            "explain": f"Pot-odds ~{req*100:.1f}%; Chen≈{s:.1f}. Exploit {exploit_adj:+.2f}"
+            "explain": f"(Preflop) Pot-odds ~{req*100:.1f}%; Chen≈{s:.1f}. Exploit {exploit_adj:+.2f} | {'Strict' if strict else 'ICM'}"
         }
 
     # Facing an open
@@ -250,7 +252,6 @@ def gto_preflop_mix(hand:str, position:Position, stack_bb:float, players_left:in
         add("CALL", call)
         fold = _clamp(1.0 - sum(p for _,p in parts)); add("FOLD", fold)
 
-        # Aggregate to CALL / RAISE / CHECK / FOLD
         agg = {"CALL":0.0,"RAISE":0.0,"CHECK":0.0,"FOLD":0.0}
         for lbl,p in parts:
             if lbl=="CALL": agg["CALL"] += p
@@ -268,10 +269,10 @@ def gto_preflop_mix(hand:str, position:Position, stack_bb:float, players_left:in
         return {
             "primary": primary, "best": best_bucket, "best_pct": best_bucket_p,
             "mix": mix, "all": allp,
-            "explain": f"Stack {stack_bb:.0f}bb; exploit {exploit_adj:+.2f}"
+            "explain": f"(Preflop) Stack {stack_bb:.0f}bb; exploit {exploit_adj:+.2f} | {'Strict' if strict else 'ICM'}"
         }
 
-    # Unopened pot (hero first to act or folded to hero)
+    # Unopened pot
     f_open = _preflop_open_freq(hi,lo,suited,position,stack_bb,bub)
     f_open = _clamp(f_open + exploit_adj*0.06)
     p_open = f_open; p_fold = 1 - p_open
@@ -296,9 +297,12 @@ def gto_preflop_mix(hand:str, position:Position, stack_bb:float, players_left:in
 
     best_bucket, best_bucket_p = max(allp.items(), key=lambda kv: kv[1])
     return {"primary":primary,"best":best_bucket,"best_pct":best_bucket_p,"mix":mix,"all":allp,
-            "explain":f"Chen; bubble x{bub:.2f}; exploit {exploit_adj:+.2f}"}
+            "explain":f"(Preflop) Chen; bubble x{bub:.2f}; exploit {exploit_adj:+.2f} | {'Strict' if strict else 'ICM'}"}
 
-def gto_postflop_mix(ctx: 'PostflopContext') -> Dict[str,str]:
+def gto_postflop_mix(ctx: 'PostflopContext', strict: bool=False) -> Dict[str,str]:
+    # In strict mode we zero out exploit advantage
+    exp = 0.0 if strict else ctx.exploit_adv
+
     hand = parse_cards(ctx.hero_hand); board = parse_cards(ctx.board_cards)
     made, tier = made_hand_strength(hand, board); texture = board_texture(board)
     outs_info = draw_outs(hand, board); cards_to_come = 2 if ctx.street=='flop' else (1 if ctx.street=='turn' else 0)
@@ -306,7 +310,7 @@ def gto_postflop_mix(ctx: 'PostflopContext') -> Dict[str,str]:
     tou = top_pair_overpair_underpair(hand, board)
     hs = _hand_strength_score(tier, draw_eq, tou)
     spr = max(0.01, ctx.eff_stack_bb / max(0.01, ctx.pot_bb))
-    adv = _range_advantage(ctx.prev_aggressor, texture) + ctx.exploit_adv*0.10
+    adv = _range_advantage(ctx.prev_aggressor, texture) + exp*0.10
     adv -= 0.1 * max(0, ctx.n_players - 2)
 
     sizes = []
@@ -319,11 +323,11 @@ def gto_postflop_mix(ctx: 'PostflopContext') -> Dict[str,str]:
     if ctx.facing_bet_bb>0:
         bet = ctx.facing_bet_bb; pot = ctx.pot_bb
         mdf = _clamp(pot/(pot+bet)) * (1.0 - max(0, ctx.n_players-2)*0.15)
-        mdf = _clamp(mdf + (-ctx.exploit_adv)*0.05)
+        mdf = _clamp(mdf + (-exp)*0.05)
         p_continue = _clamp((hs - 0.35)/0.45) * (1.0 - 0.5*max(0, ctx.n_players-2)*0.15)
         p_raise = _clamp((hs-0.70)*2.5) if spr>2 else 0.0
         p_raise *= (1.0 - max(0, ctx.n_players-2)*0.15)
-        p_raise = _clamp(p_raise + ctx.exploit_adv*0.08)
+        p_raise = _clamp(p_raise + exp*0.08)
         p_call = _clamp(p_continue - p_raise)
         if p_continue < mdf:
             p_call = _clamp(p_call + (mdf - p_continue))
@@ -335,7 +339,7 @@ def gto_postflop_mix(ctx: 'PostflopContext') -> Dict[str,str]:
         return {"primary":best,"best":best,"best_pct":best_p,
                 "mix":f"CALL {_pct_round(p_call)}% / RAISE {_pct_round(p_raise)}% / FOLD {_pct_round(p_fold)}%",
                 "all": allp,
-                "explain":f"{ctx.street.upper()} vs {bet:.1f} into {pot:.1f} | N={ctx.n_players} | hs~{hs*100:.0f}% | adv~{adv:+.2f} | SPR~{spr:.1f} | exploit {ctx.exploit_adv:+.2f}"}
+                "explain":f"({ctx.street.upper()}) vs {bet:.1f} into {pot:.1f} | N={ctx.n_players} | hs~{hs*100:.0f}% | adv~{adv:+.2f} | SPR~{spr:.1f} | {'Strict' if strict else 'ICM'}"}
 
     # No bet faced: choose bet sizes vs check
     p_bet_total = _clamp(0.15 + adv + (hs-0.45)) * (1.0 - 0.6*max(0, ctx.n_players-2)*0.15)
@@ -344,7 +348,7 @@ def gto_postflop_mix(ctx: 'PostflopContext') -> Dict[str,str]:
     for b,p in sizes:
         w = p * (0.8 + 0.6*(hs-0.5)) * (1.0 + (0.3 if b>=0.66 else 0.0))
         w *= (1.0 - 0.5*max(0, ctx.n_players-2)*0.15)
-        w *= (1.0 + ctx.exploit_adv*0.10)
+        w *= (1.0 + exp*0.10)
         bet_parts.append((b,w)); weight_sum += w
     mix_parts=[]; p_primary=p_check; primary="CHECK"; primary_p=p_check
     if weight_sum>0 and p_bet_total>0.02:
@@ -362,7 +366,7 @@ def gto_postflop_mix(ctx: 'PostflopContext') -> Dict[str,str]:
     best_bucket, best_bucket_p = max(allp.items(), key=lambda kv: kv[1])
 
     return {"primary":primary,"best":best_bucket,"best_pct":best_bucket_p,"mix":mix_str,"all":allp,
-            "explain":f"{ctx.street.upper()} | N={ctx.n_players} | hs~{hs*100:.0f}% | adv~{adv:+.2f} | SPR~{spr:.1f} | exploit {ctx.exploit_adv:+.2f}"}
+            "explain":f"({ctx.street.upper()}) | N={ctx.n_players} | hs~{hs*100:.0f}% | adv~{adv:+.2f} | SPR~{spr:.1f} | {'Strict' if strict else 'ICM'}"}
 
 def poker_decision_gto(*args, **kwargs): return gto_preflop_mix(*args, **kwargs)
 def postflop_decision_gto(*args, **kwargs):
@@ -400,7 +404,7 @@ def plotly_table(seat_count:int, btn_seat:int, hero_seat:int, pos_by_seat:Dict[i
         role = pos_by_seat.get(i,""); is_btn = (i==btn_seat); is_active = (i in active_seats)
         badge = "BTN" if is_btn else role
         opa = 1.0 if is_active else 0.35
-        fig.add_shape(type="rect", x0=x-7, y0=y-4, x1=x+7, y1=y+4, line=dict(color="#374151"), fillcolor="#111827", opacity=opa)
+        fig.add_shape(type="rect", x0=x-7, y0=y-4, x1=x+7, y1=y+4, line=dict(color="#374151"), fillcolor="#111827"), 
         fig.add_annotation(x=x, y=y, text=f"<b>Seat {i}</b><br><span style='color:#9ca3af'>{badge}</span>", showarrow=False, font=dict(color="#e5e7eb", size=11), opacity=opa)
         put = float(contribs.get(i,0.0))
         if put>0:
@@ -410,7 +414,7 @@ def plotly_table(seat_count:int, btn_seat:int, hero_seat:int, pos_by_seat:Dict[i
         i = hero_seat
         angle = -_m.pi/2 + (2*_m.pi * i / seat_count)
         hx = cx + (rx+7) * _m.cos(angle); hy = cy + (ry+10) * _m.sin(angle)
-        for k,c in enumerate(hero_codes):
+        for k,c in enumerate(hero_codes:
             fig.add_shape(type="rect", x0=hx-8+9*k, y0=hy-6, x1=hx-1+9*k, y1=hy+6, line=dict(color="#cbd5e1"), fillcolor="#f8fafc")
             r,s = c[0], c[1].lower()
             fig.add_annotation(x=hx-4+9*k, y=hy, text=f"<b>{r}{SUIT_SYM[s]}</b>", showarrow=False, font=dict(color=SUIT_COLOR[s], size=16))
@@ -425,6 +429,11 @@ street = street_map[step]; street_title = street.capitalize()
 
 # ================== Sidebar ==================
 SEATS = st.sidebar.select_slider("Seats", options=[6,8,9], value=9)
+
+# MODE TOGGLE
+mode = st.sidebar.radio("Mode", ["Exploit + ICM", "Strict GTO"], horizontal=True)
+strict_mode = (mode == "Strict GTO")
+
 with st.sidebar:
     st.subheader("Tournament Context")
     stack_bb = st.number_input("Effective Stack (BB)", min_value=1, value=25, key="stack_bb")
@@ -486,14 +495,15 @@ active_order = [s for s in seat_sequence if s in active_indices]
 hero_pos_label = pos_by_seat.get(hero_seat, "CO")
 players_in_pot = max(2, len(active_indices))
 
-# Personalities -> exploit
+# Personalities -> exploit (disabled in Strict GTO)
 weights=[]
 for i in range(SEATS):
     if not seat_active[i] or i==hero_seat: continue
     p = seat_persona[i]
     w = {"professional-aggressive":0.8,"amateur-loose":0.4,"professional-conservative":-0.4,"amateur-conservative":-0.2}.get(p,0.0)
     weights.append(w)
-exploit_adv = float(max(-1.0, min(1.0, (sum(weights)/len(weights)) if weights else 0.0)))
+exploit_adv_raw = float(max(-1.0, min(1.0, (sum(weights)/len(weights)) if weights else 0.0)))
+exploit_adv = 0.0 if strict_mode else exploit_adv_raw
 
 # ================== Betting Order ==================
 def betting_order(street_step:int, btn:int, seats:int, only_active=True) -> List[int]:
@@ -624,7 +634,7 @@ def simulate_until_return(street_step:int, btn:int, seats:int, actions:Dict[int,
         if s == hero:
             after = True
             continue
-        if not after:  # still the segment before hero we already processed
+        if not after:
             continue
         a = actions.get(s, {"type":"No action","size":0.0})
         t = a.get("type","No action"); size = float(a.get("size",0.0))
@@ -661,16 +671,11 @@ cur_actions: Dict[int, Dict[str, float]] = st.session_state.actions.get(step, {}
 
 # Snapshot if we act immediately:
 c1_contribs, c1_bet, c1_pot, c1_last = simulate_up_to_hero(step, btn_seat, SEATS, cur_actions, hero_seat)
-c1_hero_prev = c1_contribs.get(hero_seat, 0.0)
-c1_facing = max(0.0, c1_bet - c1_hero_prev)
 
 # Snapshot if table continues and action returns once:
 c2_contribs, c2_bet, c2_pot, c2_last = simulate_until_return(step, btn_seat, SEATS, cur_actions, hero_seat)
-c2_hero_prev = c2_contribs.get(hero_seat, 0.0)
-c2_facing = max(0.0, c2_bet - c2_hero_prev)
 
 # AUTO PICK: if players behind changed the current bet (e.g., 3-bet), use c2; otherwise c1.
-# We consider it "changed behind" if either (a) the bet size differs, or (b) pot differs due to their action.
 use_return_snapshot = (abs(c2_bet - c1_bet) > 1e-9) or (abs(c2_pot - c1_pot) > 1e-9)
 
 contribs_before = c2_contribs if use_return_snapshot else c1_contribs
@@ -687,6 +692,7 @@ prev_aggressor_flag = "none" if step==0 else ("none" if last_agg_prev is None el
 
 # ================== Validation & Decision ==================
 errs=[]
+# Basic input sanity (only enforce street-specific board)
 if len(hero_hand)!=4: errs.append("Select both of your hole cards.")
 if step>=1 and len(board_cards)<6: errs.append("Pick all 3 flop cards.")
 if step>=2 and len(board_cards)<8: errs.append("Pick turn card.")
@@ -694,7 +700,7 @@ if step>=3 and len(board_cards)<10: errs.append("Pick river card.")
 
 col_left, col_right = st.columns([1,1])
 with col_left:
-    st.markdown(f"**Mode:** Exploit + ICM")  # (kept: personalities and bubble factor)
+    st.markdown(f"**Mode:** {'Strict GTO' if strict_mode else 'Exploit + ICM'}")
     st.markdown(f"**Hero Seat:** {hero_seat} • **Hero Position:** {hero_pos_label} • **BTN:** {btn_seat}")
     st.markdown(f"**Players in Pot:** {players_in_pot} • **Exploit:** {exploit_adv:+.2f}")
 with col_right:
@@ -718,7 +724,7 @@ else:
             facing_shove=(current_bet_now >= max(1.0, float(stack_bb)*0.7)),
             shove_size_bb=float(facing_bet_now),
             pot_before_hero_bb=float(pot_before_hero),
-            exploit_adj=exploit_adv
+            exploit_adj=exploit_adv, strict=strict_mode
         )
     else:
         position_post = "IP" if hero_pos_label in ("BTN","CO","HJ","LJ") else "OOP"
@@ -727,7 +733,8 @@ else:
             pot_bb=float(carry_pot + pot_before_hero), eff_stack_bb=float(stack_bb),
             facing_bet_bb=float(facing_bet_now), position=position_post,
             n_players=players_in_pot, prev_aggressor=prev_aggressor_flag, exploit_adv=exploit_adv
-        ))
+        ), strict=strict_mode)
+
     st.subheader(f"Decision — {street_title}")
     if result:
         pct = int(round(_clamp(result.get('best_pct',0.0),0.0,1.0)*100))
@@ -755,4 +762,4 @@ if back and step>0: st.session_state.step -= 1
 if nxt and step<3: st.session_state.step += 1
 
 st.markdown("<hr/>", unsafe_allow_html=True)
-st.caption("Deploy tip: keep this file plain-text UTF-8; add requirements.txt with streamlit and plotly.")
+st.caption("Deploy tip: keep this file plain-text UTF-8; add requirements.txt with streamlit==1.36.0 and plotly==5.22.0.")
