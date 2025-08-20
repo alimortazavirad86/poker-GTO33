@@ -5,10 +5,16 @@ import math
 from collections import Counter
 import plotly.graph_objects as go
 
-# ================== Poker GTO Helper — Build v9e (Plotly table + full action mix) ==================
-st.set_page_config(page_title="Poker GTO Helper", page_icon="♠️", layout="wide")
-st.title("♠️ Poker GTO Decision Helper")
-st.caption("Build: v9e • Plotly-rendered table • Auto-call allocation • Decision box shows all action percentages • Decision-point toggle (handles 3-bets behind you)")
+# ================== Poker GTO Helper — Big Table (Auto "action behind") ==================
+# - Full-featured table: seats, blinds, action windows, pot auto-adjust
+# - Plotly-rendered table
+# - Decision box shows best action + full action percentages
+# - AUTO: if players behind you raise/call and change the price before action returns to you,
+#         the decision automatically recomputes with the updated facing bet.
+
+st.set_page_config(page_title="Poker GTO Helper (Unified)", page_icon="♠️", layout="wide")
+st.title("♠️ Poker GTO Decision Helper — Unified")
+st.caption("Big-table app with Plotly table, pot evolution, and automatic re-compute if action changes behind you")
 
 # -------- Core cards --------
 Position = Literal["UTG", "MP", "CO", "BTN", "SB", "BB"]
@@ -138,56 +144,31 @@ def bubble_factor(players_left:int, total_players:int) -> float:
     if pct<=0.15: return 1.3
     return 1.0
 
-# ---------- FIXED: Unopened-pot open frequency (pocket-pair boost + late-position floors) ----------
+# ---------- Preflop open frequency (tuned) ----------
 def _preflop_open_freq(hi:str, lo:str, suited:bool, position:Position, stack_bb:float, bubble_mult:float) -> float:
-    """
-    Baseline open frequency in unopened pots.
-    Tweaks:
-      • Pocket-pair boost (esp. 66–99 and TT+)
-      • Late-position bonus (CO/BTN/SB)
-      • Floors so pairs (like 88) don't get folded too often from CO/BTN/SB
-    """
     s = chen_score(hi,lo,suited)
-
-    # Pocket-pair boost
     pair = (hi == lo)
     if pair:
         rv = RANK_TO_VAL[hi]
-        if rv >= 10:      # TT+
-            s += 2.0
-        elif rv >= 8:     # 88–99
-            s += 1.5
-        elif rv >= 6:     # 66–77
-            s += 1.0
-        else:             # 22–55
-            s += 0.5
-
-    # Late-position bonus
+        if rv >= 10: s += 2.0
+        elif rv >= 8: s += 1.5
+        elif rv >= 6: s += 1.0
+        else: s += 0.5
     s += {"CO": 1.0, "BTN": 1.6, "SB": 0.6}.get(position, 0.0)
-
-    # Threshold by position/stack/bubble
     base_t = 12.0 * _POS_TIGHTNESS.get(position,1.0)
     if stack_bb<=12: base_t += 1.0
     if stack_bb<=8:  base_t += 1.0
     base_t *= bubble_mult
-
     f = _clamp(_sigmoid((s - base_t)/2.2))
-
-    # Floors for pairs in late positions
     if pair:
         rv = RANK_TO_VAL[hi]
         if position == "BTN":
-            f = max(f, 0.55)            # any pair at least 55% open on BTN
-            if rv >= 8:                 # 88+
-                f = max(f, 0.70)
+            f = max(f, 0.55);  f = max(f, 0.70 if rv>=8 else f)
         elif position == "CO":
-            f = max(f, 0.42)
-            if rv >= 8:
-                f = max(f, 0.58)
+            f = max(f, 0.42);  f = max(f, 0.58 if rv>=8 else f)
         elif position == "SB":
             f = max(f, 0.38)
     return f
-# -----------------------------------------------------------------------------------------------
 
 def _preflop_three_bet_split(hi:str, lo:str, suited:bool, position:Position, vs_open_size_bb:float, stack_bb:float) -> Tuple[float,float,float]:
     s = chen_score(hi,lo,suited)
@@ -208,6 +189,7 @@ def _hand_strength_score(made_tier:int, outs_eq:float, tou:Optional[str]) -> flo
     if tou in ("overpair","top_pair"): base += 0.05
     if tou=="underpair": base -= 0.05
     return _clamp(max(base, outs_eq))
+
 def _range_advantage(prev_aggressor:str, texture:Dict[str,float]) -> float:
     adv = 0.0
     if prev_aggressor=="hero": adv += 0.25
@@ -228,14 +210,14 @@ class PostflopContext:
     prev_aggressor: Literal["hero","villain","none"] = "none"
     exploit_adv: float = 0.0
 
-# ================== Strategy (now returns full action mix) ==================
+# ================== Strategy (returns full action mix) ==================
 def gto_preflop_mix(hand:str, position:Position, stack_bb:float, players_left:int, total_players:int,
                     facing_open:bool=False, open_size_bb:float=2.5, facing_shove:bool=False, shove_size_bb:float=0.0,
                     pot_before_hero_bb:float=0.0, exploit_adj:float=0.0) -> Dict[str,str]:
     combo, hi, lo, suited = normalize_combo(hand)
     bub = bubble_factor(players_left, total_players)
 
-    # Facing all-in
+    # Facing jam
     if facing_shove and shove_size_bb>0:
         pot_before = pot_before_hero_bb if pot_before_hero_bb>0 else 1.5
         req = shove_size_bb / max(1e-9, (pot_before + shove_size_bb)) * bub
@@ -282,7 +264,6 @@ def gto_preflop_mix(hand:str, position:Position, stack_bb:float, players_left:in
         else:
             primary, primary_p, mix = "FOLD", 1.0, "FOLD 100%"
 
-        # Choose best among aggregated buckets for display as well
         best_bucket, best_bucket_p = max(allp.items(), key=lambda kv: kv[1])
         return {
             "primary": primary, "best": best_bucket, "best_pct": best_bucket_p,
@@ -307,7 +288,6 @@ def gto_preflop_mix(hand:str, position:Position, stack_bb:float, players_left:in
     else:
         primary, primary_p, mix = "FOLD", 1.0, "FOLD 100%"
 
-    # Aggregate to buckets
     agg = {"CALL":0.0,"RAISE":0.0,"CHECK":0.0,"FOLD":0.0}
     for lbl,p in parts:
         if lbl.startswith("OPEN") or "JAM" in lbl: agg["RAISE"] += p
@@ -327,7 +307,7 @@ def gto_postflop_mix(ctx: 'PostflopContext') -> Dict[str,str]:
     hs = _hand_strength_score(tier, draw_eq, tou)
     spr = max(0.01, ctx.eff_stack_bb / max(0.01, ctx.pot_bb))
     adv = _range_advantage(ctx.prev_aggressor, texture) + ctx.exploit_adv*0.10
-    adv -= 0.1 * max(0, ctx.n_players - 2)  # multiway penalty
+    adv -= 0.1 * max(0, ctx.n_players - 2)
 
     sizes = []
     if ctx.street=='flop': sizes = [(0.33, 0.5+adv), (0.66, 0.3-adv/2)]
@@ -375,7 +355,6 @@ def gto_postflop_mix(ctx: 'PostflopContext') -> Dict[str,str]:
     mix_parts.append(("CHECK", p_check))
     mix_str = " / ".join([f"{lbl} {_pct_round(p)}%" for lbl,p in mix_parts])
 
-    # Aggregate to buckets for display
     agg = {"CALL":0.0,"RAISE":0.0,"CHECK":p_check,"FOLD":0.0}
     for lbl,p in mix_parts:
         if lbl.startswith("BET"): agg["RAISE"] += p
@@ -393,7 +372,6 @@ def postflop_decision_gto(*args, **kwargs):
 def plotly_table(seat_count:int, btn_seat:int, hero_seat:int, pos_by_seat:Dict[int,str],
                  active_seats:List[int], contribs:Dict[int,float], total_pot:float,
                  board_codes:List[str], hero_codes:List[str], width:int=900, height:int=520):
-    # Base figure
     fig = go.Figure()
     fig.update_layout(width=width, height=height, plot_bgcolor="#0b1225", paper_bgcolor="#0b1225",
                       xaxis=dict(visible=False, range=[0,100]), yaxis=dict(visible=False, range=[0,100]),
@@ -411,8 +389,9 @@ def plotly_table(seat_count:int, btn_seat:int, hero_seat:int, pos_by_seat:Dict[i
         start_x = 50 - 6*len(board_codes)
         for i,c in enumerate(board_codes):
             fig.add_shape(type="rect", x0=start_x+12*i-4, y0=58, x1=start_x+12*i+4, y1=72, line=dict(color="#cbd5e1"), fillcolor="#f8fafc")
-            r,s = c[0], c[1].lower(); fig.add_annotation(x=start_x+12*i, y=65, text=f"<b>{r}{SUIT_SYM[s]}</b>", showarrow=False, font=dict(color=SUIT_COLOR[s], size=16))
-    # seat positions ellipse
+            r,s = c[0], c[1].lower()
+            fig.add_annotation(x=start_x+12*i, y=65, text=f"<b>{r}{SUIT_SYM[s]}</b>", showarrow=False, font=dict(color=SUIT_COLOR[s], size=16))
+    # seats on ellipse
     import math as _m
     cx, cy = 50, 50; rx, ry = 34, 30
     for i in range(seat_count):
@@ -425,7 +404,7 @@ def plotly_table(seat_count:int, btn_seat:int, hero_seat:int, pos_by_seat:Dict[i
         fig.add_annotation(x=x, y=y, text=f"<b>Seat {i}</b><br><span style='color:#9ca3af'>{badge}</span>", showarrow=False, font=dict(color="#e5e7eb", size=11), opacity=opa)
         put = float(contribs.get(i,0.0))
         if put>0:
-            fig.add_annotation(x=x, y=y-6.5, text=f"<b>{put:.2f}</b>", showarrow=False, font=dict(color="#ffffff", size=11), bgcolor="#ef4444")
+            fig.add_annotation(x=x, y=y-6.5, text=f"<b>{put:.2f}</b>", showarrow=False, font=dict(color="#ffffff", size=11))
     # Hero hand outside ellipse
     if len(hero_codes)==2:
         i = hero_seat
@@ -433,7 +412,8 @@ def plotly_table(seat_count:int, btn_seat:int, hero_seat:int, pos_by_seat:Dict[i
         hx = cx + (rx+7) * _m.cos(angle); hy = cy + (ry+10) * _m.sin(angle)
         for k,c in enumerate(hero_codes):
             fig.add_shape(type="rect", x0=hx-8+9*k, y0=hy-6, x1=hx-1+9*k, y1=hy+6, line=dict(color="#cbd5e1"), fillcolor="#f8fafc")
-            r,s = c[0], c[1].lower(); fig.add_annotation(x=hx-4+9*k, y=hy, text=f"<b>{r}{SUIT_SYM[s]}</b>", showarrow=False, font=dict(color=SUIT_COLOR[s], size=16))
+            r,s = c[0], c[1].lower()
+            fig.add_annotation(x=hx-4+9*k, y=hy, text=f"<b>{r}{SUIT_SYM[s]}</b>", showarrow=False, font=dict(color=SUIT_COLOR[s], size=16))
     st.plotly_chart(fig, use_container_width=False)
 
 # ================== Session State ==================
@@ -445,7 +425,6 @@ street = street_map[step]; street_title = street.capitalize()
 
 # ================== Sidebar ==================
 SEATS = st.sidebar.select_slider("Seats", options=[6,8,9], value=9)
-
 with st.sidebar:
     st.subheader("Tournament Context")
     stack_bb = st.number_input("Effective Stack (BB)", min_value=1, value=25, key="stack_bb")
@@ -525,14 +504,6 @@ def betting_order(street_step:int, btn:int, seats:int, only_active=True) -> List
     return order
 order_now = betting_order(step, btn_seat, SEATS, only_active=True)
 
-# ================== Decision point (first act vs. facing action behind) ==================
-decision_point = st.radio(
-    "Decision point",
-    ["First action", "After action behind (return to hero)"],
-    horizontal=True,
-    key="decision_point"
-)
-
 # ================== Action Windows (per seat) ==================
 st.subheader(f"Actions — {street_title}")
 ACTIONS = ["No action","Fold","Check/Call","Bet/Raise"]
@@ -547,7 +518,7 @@ for idx, seat in enumerate(order_now):
         cur_actions[seat] = {"type": act, "size": float(size)}
 st.session_state.actions[step] = cur_actions
 
-# ================== Betting simulation ==================
+# ================== Betting simulation helpers ==================
 def simulate_street(street_step:int, btn:int, seats:int, actions:Dict[int,Dict[str,float]], hero:int) -> Tuple[Dict[int,float], float, float, Optional[int]]:
     contribs = {i:0.0 for i in range(seats)}
     if street_step==0:
@@ -566,16 +537,222 @@ def simulate_street(street_step:int, btn:int, seats:int, actions:Dict[int,Dict[s
         if t=="Fold":
             pass
         elif t=="Check/Call":
-            # AUTO-CALL: contribute exactly what is needed to match the current bet
             need = max(0.0, current_bet - prev)
             contribs[s] = prev + need
         elif t=="Bet/Raise":
-            # 'size' is the TARGET bet (not increment)
             target = max(current_bet, 0.0)
-            if street_step==0 and prev<1.0: target = max(1.0, target)  # behind blinds ensure ≥ BB
+            if street_step==0 and prev<1.0: target = max(1.0, target)
             target = max(target, size)
             need = max(0.0, target - prev)
             contribs[s] = prev + need
             if target > current_bet + 1e-9:
                 current_bet = target; last_agg = s
-        pot_total
+        pot_total = sum(contribs.values())
+    return contribs, current_bet, pot_total, last_agg
+
+def simulate_up_to_hero(street_step:int, btn:int, seats:int, actions:Dict[int,Dict[str,float]], hero:int) -> Tuple[Dict[int,float], float, float, Optional[int]]:
+    contribs = {i:0.0 for i in range(seats)}
+    if street_step==0:
+        sb = (btn + 1) % seats; bb = (btn + 2) % seats
+        contribs[sb] += 0.5; contribs[bb] += 1.0
+        current_bet = 1.0
+    else:
+        current_bet = 0.0
+    order = betting_order(street_step, btn, seats, only_active=True)
+    pot_total = sum(contribs.values()); last_agg = None
+    for s in order:
+        if s == hero: break
+        a = actions.get(s, {"type":"No action","size":0.0})
+        t = a.get("type","No action"); size = float(a.get("size",0.0))
+        prev = contribs.get(s,0.0)
+        if t=="Fold":
+            pass
+        elif t=="Check/Call":
+            need = max(0.0, current_bet - prev)
+            contribs[s] = prev + need
+        elif t=="Bet/Raise":
+            target = max(current_bet, size)
+            if street_step==0 and prev<1.0: target = max(1.0, target)
+            need = max(0.0, target - prev)
+            contribs[s] = prev + need
+            if target > current_bet + 1e-9:
+                current_bet = target; last_agg = s
+        pot_total = sum(contribs.values())
+    return contribs, current_bet, pot_total, last_agg
+
+def simulate_until_return(street_step:int, btn:int, seats:int, actions:Dict[int,Dict[str,float]], hero:int) -> Tuple[Dict[int,float], float, float, Optional[int]]:
+    """
+    Simulate the entire street snapshot when action returns to hero once:
+    - players before hero act
+    - hero does NOT act
+    - players after hero act once
+    """
+    contribs = {i:0.0 for i in range(seats)}
+    if street_step==0:
+        sb = (btn + 1) % seats; bb = (btn + 2) % seats
+        contribs[sb] += 0.5; contribs[bb] += 1.0
+        current_bet = 1.0
+    else:
+        current_bet = 0.0
+
+    pot_total = sum(contribs.values()); last_agg = None
+    order = betting_order(street_step, btn, seats, only_active=True)
+
+    # Before hero
+    for s in order:
+        if s == hero: break
+        a = actions.get(s, {"type":"No action","size":0.0})
+        t = a.get("type","No action"); size = float(a.get("size",0.0))
+        prev = contribs.get(s,0.0)
+        if t=="Fold":
+            pass
+        elif t=="Check/Call":
+            need = max(0.0, current_bet - prev)
+            contribs[s] = prev + need
+        elif t=="Bet/Raise":
+            target = max(current_bet, size)
+            if street_step==0 and prev<1.0: target = max(1.0, target)
+            need = max(0.0, target - prev)
+            contribs[s] = prev + need
+            if target > current_bet + 1e-9:
+                current_bet = target; last_agg = s
+        pot_total = sum(contribs.values())
+
+    # After hero (one pass) -> when it returns, we stop
+    after = False
+    for s in order:
+        if s == hero:
+            after = True
+            continue
+        if not after:  # still the segment before hero we already processed
+            continue
+        a = actions.get(s, {"type":"No action","size":0.0})
+        t = a.get("type","No action"); size = float(a.get("size",0.0))
+        prev = contribs.get(s,0.0)
+        if t=="Fold":
+            pass
+        elif t=="Check/Call":
+            need = max(0.0, current_bet - prev)
+            contribs[s] = prev + need
+        elif t=="Bet/Raise":
+            target = max(current_bet, size)
+            if street_step==0 and prev<1.0: target = max(1.0, target)
+            need = max(0.0, target - prev)
+            contribs[s] = prev + need
+            if target > current_bet + 1e-9:
+                current_bet = target; last_agg = s
+        pot_total = sum(contribs.values())
+
+    hero_prev = contribs.get(hero, 0.0)
+    facing = max(0.0, current_bet - hero_prev)
+    return contribs, current_bet, pot_total, last_agg
+
+def pot_carry_to(street_step:int) -> Tuple[float, Optional[int]]:
+    pot = 0.0; last_agg_prev = None
+    for s in range(street_step):
+        actions_prev = st.session_state.actions.get(s, {})
+        contribs_prev, _, pot_end, last_agg_prev = simulate_street(s, btn_seat, SEATS, actions_prev, hero_seat)
+        pot = pot_end
+    return pot, last_agg_prev
+
+# ================== Compute state (AUTO choose: before-hero vs after-return) ==================
+carry_pot, last_agg_prev = pot_carry_to(step)
+cur_actions: Dict[int, Dict[str, float]] = st.session_state.actions.get(step, {})
+
+# Snapshot if we act immediately:
+c1_contribs, c1_bet, c1_pot, c1_last = simulate_up_to_hero(step, btn_seat, SEATS, cur_actions, hero_seat)
+c1_hero_prev = c1_contribs.get(hero_seat, 0.0)
+c1_facing = max(0.0, c1_bet - c1_hero_prev)
+
+# Snapshot if table continues and action returns once:
+c2_contribs, c2_bet, c2_pot, c2_last = simulate_until_return(step, btn_seat, SEATS, cur_actions, hero_seat)
+c2_hero_prev = c2_contribs.get(hero_seat, 0.0)
+c2_facing = max(0.0, c2_bet - c2_hero_prev)
+
+# AUTO PICK: if players behind changed the current bet (e.g., 3-bet), use c2; otherwise c1.
+# We consider it "changed behind" if either (a) the bet size differs, or (b) pot differs due to their action.
+use_return_snapshot = (abs(c2_bet - c1_bet) > 1e-9) or (abs(c2_pot - c1_pot) > 1e-9)
+
+contribs_before = c2_contribs if use_return_snapshot else c1_contribs
+current_bet_now = c2_bet if use_return_snapshot else c1_bet
+pot_before_hero = c2_pot if use_return_snapshot else c1_pot
+last_agg_before = c2_last if use_return_snapshot else c1_last
+
+hero_prev = contribs_before.get(hero_seat, 0.0)
+facing_bet_now = max(0.0, current_bet_now - hero_prev)
+
+# Also compute the full street (for live pot rendering)
+contribs_full, current_bet_full, pot_full, last_agg_full = simulate_street(step, btn_seat, SEATS, cur_actions, hero_seat)
+prev_aggressor_flag = "none" if step==0 else ("none" if last_agg_prev is None else ("hero" if last_agg_prev == hero_seat else "villain"))
+
+# ================== Validation & Decision ==================
+errs=[]
+if len(hero_hand)!=4: errs.append("Select both of your hole cards.")
+if step>=1 and len(board_cards)<6: errs.append("Pick all 3 flop cards.")
+if step>=2 and len(board_cards)<8: errs.append("Pick turn card.")
+if step>=3 and len(board_cards)<10: errs.append("Pick river card.")
+
+col_left, col_right = st.columns([1,1])
+with col_left:
+    st.markdown(f"**Mode:** Exploit + ICM")  # (kept: personalities and bubble factor)
+    st.markdown(f"**Hero Seat:** {hero_seat} • **Hero Position:** {hero_pos_label} • **BTN:** {btn_seat}")
+    st.markdown(f"**Players in Pot:** {players_in_pot} • **Exploit:** {exploit_adv:+.2f}")
+with col_right:
+    st.markdown("**Facing now**")
+    st.write(f"Current required to call: **{facing_bet_now:.2f} BB**")
+    st.write(f"Pot before hero acts (this street snapshot): **{pot_before_hero:.2f} BB**")
+    if use_return_snapshot:
+        st.caption("Auto: action behind changed the price → using 'return to hero' snapshot")
+    if step>0: st.write(f"Prev street aggressor (auto): **{prev_aggressor_flag.upper()}**")
+
+if errs:
+    st.error("\n".join([f"• {e}" for e in errs]))
+    result = None
+else:
+    if street=="preflop":
+        position = hero_pos_label if hero_pos_label in ["UTG","MP","CO","BTN","SB","BB"] else "MP"
+        result = gto_preflop_mix(
+            hand=hero_hand, position=position, stack_bb=float(stack_bb),
+            players_left=int(players_left), total_players=int(total_players),
+            facing_open=(current_bet_now>1.0), open_size_bb=max(2.0, float(current_bet_now)),
+            facing_shove=(current_bet_now >= max(1.0, float(stack_bb)*0.7)),
+            shove_size_bb=float(facing_bet_now),
+            pot_before_hero_bb=float(pot_before_hero),
+            exploit_adj=exploit_adv
+        )
+    else:
+        position_post = "IP" if hero_pos_label in ("BTN","CO","HJ","LJ") else "OOP"
+        result = gto_postflop_mix(PostflopContext(
+            street=street, hero_hand=hero_hand, board_cards=board_cards,
+            pot_bb=float(carry_pot + pot_before_hero), eff_stack_bb=float(stack_bb),
+            facing_bet_bb=float(facing_bet_now), position=position_post,
+            n_players=players_in_pot, prev_aggressor=prev_aggressor_flag, exploit_adv=exploit_adv
+        ))
+    st.subheader(f"Decision — {street_title}")
+    if result:
+        pct = int(round(_clamp(result.get('best_pct',0.0),0.0,1.0)*100))
+        st.success(f"{result.get('best','')} — {pct}%")
+        # Show all action percentages (CALL / BET/RAISE / CHECK / FOLD)
+        allp = result.get("all", {})
+        if allp:
+            st.markdown("**Action mix**")
+            for lbl, p in sorted(allp.items(), key=lambda kv: kv[1], reverse=True):
+                lab = "BET/RAISE" if lbl == "RAISE" else lbl
+                st.write(f"• {lab}: **{int(round(_clamp(p,0,1)*100))}%**")
+        st.caption("Recomputes automatically if action behind changes the price before it returns to you.")
+
+# ================== Live Table (Plotly) ==================
+st.subheader(f"Live Table — {street_title} (Pot includes carry from prior streets)")
+board_codes = [board_cards[i:i+2] for i in range(0,len(board_cards),2) if board_cards]
+hero_codes = [hero_hand[0:2], hero_hand[2:4]] if len(hero_hand)==4 else []
+plotly_table(SEATS, btn_seat, hero_seat, pos_by_seat, active_order, contribs_full, carry_pot + pot_full, board_codes, hero_codes, width=900, height=540)
+
+# ================== Navigation ==================
+nav_cols = st.columns([1,1,6])
+with nav_cols[0]: back = st.button("◀ Back", disabled=(step==0), key="btn_back")
+with nav_cols[1]: nxt = st.button("Next ▶", disabled=(step==3), key="btn_next")
+if back and step>0: st.session_state.step -= 1
+if nxt and step<3: st.session_state.step += 1
+
+st.markdown("<hr/>", unsafe_allow_html=True)
+st.caption("Deploy tip: keep this file plain-text UTF-8; add requirements.txt with streamlit and plotly.")
